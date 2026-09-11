@@ -4,6 +4,10 @@
 #include <Preferences.h>
 #include <math.h>
 #include <string.h>
+#include <stdarg.h>
+#include <esp_sleep.h>
+#include <esp_wifi.h>
+#include <driver/uart.h>
 #include "config.h"
 
 HardwareSerial SensorSerial(SENSOR_UART_NUM);
@@ -27,16 +31,176 @@ struct Config {
   float distFullCm;
   float tankLiters;
   uint16_t intervalSec;
+  uint8_t serialEol;  // SerialEol value, persisted
 } cfg;
 
 bool wifiOk = false;
 bool mqttOk = false;
+
+// Line ending for console output (CR / LF / CRLF); synced with cfg.serialEol
+enum SerialEol : uint8_t { EOL_UNKNOWN = 0, EOL_LF = 1, EOL_CR = 2, EOL_CRLF = 3 };
+SerialEol serialEol = EOL_UNKNOWN;
 
 // -------------------- Serial helpers --------------------
 void flushSerialInput() {
   while (Serial.available()) {
     Serial.read();
   }
+}
+
+const char *serialEolName(SerialEol mode) {
+  switch (mode) {
+    case EOL_LF: return "LF (0x0A)";
+    case EOL_CR: return "CR (0x0D)";
+    case EOL_CRLF: return "CRLF (0x0D 0x0A)";
+    case EOL_UNKNOWN:
+    default: return "auto (learn from Enter)";
+  }
+}
+
+// Single source of truth for EOL bytes (also used by self-test)
+size_t serialEolBytes(SerialEol mode, uint8_t *out, size_t maxOut) {
+  if (maxOut == 0 || out == nullptr) {
+    return 0;
+  }
+  switch (mode) {
+    case EOL_CR:
+      out[0] = 0x0D;
+      return 1;
+    case EOL_LF:
+      out[0] = 0x0A;
+      return 1;
+    case EOL_CRLF:
+    case EOL_UNKNOWN:
+    default:
+      if (maxOut < 2) {
+        out[0] = 0x0D;
+        return 1;
+      }
+      out[0] = 0x0D;
+      out[1] = 0x0A;
+      return 2;
+  }
+}
+
+void applySerialEol(SerialEol mode) {
+  serialEol = mode;
+  cfg.serialEol = (uint8_t)mode;
+}
+
+void serialWriteEol() {
+  uint8_t bytes[2];
+  size_t n = serialEolBytes(serialEol, bytes, sizeof(bytes));
+  for (size_t i = 0; i < n; i++) {
+    Serial.write(bytes[i]);
+  }
+}
+
+void serialPrintln() {
+  serialWriteEol();
+}
+
+void serialPrintln(const char *msg) {
+  Serial.print(msg);
+  serialWriteEol();
+}
+
+void serialPrintln(const String &msg) {
+  Serial.print(msg);
+  serialWriteEol();
+}
+
+void serialPrintln(const IPAddress &ip) {
+  Serial.print(ip);
+  serialWriteEol();
+}
+
+// Like printf, but every '\n' in the result uses the configured CR/LF style
+void serialPrintf(const char *fmt, ...) {
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  for (const char *p = buf; *p; ++p) {
+    if (*p == '\n') {
+      serialWriteEol();
+    } else if (*p == '\r') {
+      // Ignore literal CR in format strings; EOL helper owns line breaks
+      continue;
+    } else {
+      Serial.write((uint8_t)*p);
+    }
+  }
+}
+
+bool selfTestSerialEol() {
+  uint8_t buf[4];
+  size_t n;
+
+  n = serialEolBytes(EOL_LF, buf, sizeof(buf));
+  if (n != 1 || buf[0] != 0x0A) {
+    return false;
+  }
+
+  n = serialEolBytes(EOL_CR, buf, sizeof(buf));
+  if (n != 1 || buf[0] != 0x0D) {
+    return false;
+  }
+
+  n = serialEolBytes(EOL_CRLF, buf, sizeof(buf));
+  if (n != 2 || buf[0] != 0x0D || buf[1] != 0x0A) {
+    return false;
+  }
+
+  n = serialEolBytes(EOL_UNKNOWN, buf, sizeof(buf));
+  if (n != 2 || buf[0] != 0x0D || buf[1] != 0x0A) {
+    return false;
+  }
+
+  // Active mode must match cfg
+  if ((uint8_t)serialEol != cfg.serialEol) {
+    return false;
+  }
+
+  return true;
+}
+
+// Remember and echo the EOL sequence that was actually received
+void absorbAndEchoEol(char first) {
+  delay(5);  // allow second byte of CRLF/LFCR to arrive
+  char second = 0;
+  if (Serial.available()) {
+    char next = (char)Serial.peek();
+    if ((first == '\r' && next == '\n') || (first == '\n' && next == '\r')) {
+      second = (char)Serial.read();
+    }
+  }
+
+  SerialEol mode;
+  if ((first == '\r' && second == '\n') || (first == '\n' && second == '\r')) {
+    mode = EOL_CRLF;
+  } else if (first == '\r') {
+    mode = EOL_CR;
+  } else {
+    mode = EOL_LF;
+  }
+
+  applySerialEol(mode);
+  serialWriteEol();
+}
+
+// If the wake byte is CR/LF, learn EOL before flushing the rest
+bool consumeSerialWake() {
+  if (!Serial.available()) {
+    return false;
+  }
+  char c = (char)Serial.read();
+  if (c == '\r' || c == '\n') {
+    absorbAndEchoEol(c);
+  }
+  flushSerialInput();
+  return true;
 }
 
 String readLine(const char *prompt) {
@@ -46,13 +210,13 @@ String readLine(const char *prompt) {
   while (true) {
     while (Serial.available()) {
       char c = (char)Serial.read();
-      if (c == '\r') {
-        continue;
-      }
-      if (c == '\n') {
-        Serial.println();
+
+      // End of line: CR (0x0D) and/or LF (0x0A)
+      if (c == '\r' || c == '\n') {
+        absorbAndEchoEol(c);
         return line;
       }
+
       if (c == 0x08 || c == 0x7F) {
         if (line.length() > 0) {
           line.remove(line.length() - 1);
@@ -148,6 +312,11 @@ void applyCompileDefaults() {
   cfg.distFullCm = CFG_DIST_FULL_SET ? CFG_DIST_FULL_CM : NAN;
   cfg.tankLiters = CFG_TANK_LITERS_SET ? CFG_TANK_LITERS : NAN;
   cfg.intervalSec = CFG_INTERVAL_SEC;
+  cfg.serialEol = (uint8_t)CFG_SERIAL_EOL;
+  if (cfg.serialEol > (uint8_t)EOL_CRLF) {
+    cfg.serialEol = (uint8_t)EOL_UNKNOWN;
+  }
+  applySerialEol((SerialEol)cfg.serialEol);
 }
 
 void loadConfig() {
@@ -187,7 +356,15 @@ void loadConfig() {
     cfg.tankLiters = NAN;
   }
   cfg.intervalSec = prefs.getUShort("interval", cfg.intervalSec);
+  if (prefs.isKey("serialEol")) {
+    uint8_t eol = prefs.getUChar("serialEol", cfg.serialEol);
+    if (eol <= (uint8_t)EOL_CRLF) {
+      cfg.serialEol = eol;
+    }
+  }
   prefs.end();
+
+  applySerialEol((SerialEol)cfg.serialEol);
 }
 
 void saveConfig() {
@@ -226,70 +403,88 @@ void saveConfig() {
   }
 
   prefs.putUShort("interval", cfg.intervalSec);
+  cfg.serialEol = (uint8_t)serialEol;
+  prefs.putUChar("serialEol", cfg.serialEol);
   prefs.end();
-  Serial.println("Configuration saved.");
+  serialPrintln("Configuration saved.");
 }
 
 void printOptionalCm(const char *label, float value) {
   Serial.print(label);
   if (isnan(value)) {
-    Serial.println("(unset)");
+    serialPrintln("(unset)");
   } else {
-    Serial.printf("%.1f cm\n", value);
+    serialPrintf("%.1f cm\n", value);
   }
 }
 
 void printOptionalLiters(const char *label, float value) {
   Serial.print(label);
   if (isnan(value)) {
-    Serial.println("(unset)");
+    serialPrintln("(unset)");
   } else {
-    Serial.printf("%.0f liters\n", value);
+    serialPrintf("%.0f liters\n", value);
   }
 }
 
 void printConfig() {
-  Serial.println();
-  Serial.println("---------- Current configuration ----------");
-  Serial.printf("  WiFi enabled:   %s\n", cfg.wifiEnabled ? "yes" : "no");
-  Serial.printf("  MQTT enabled:   %s\n", cfg.mqttEnabled ? "yes" : "no");
-  Serial.printf("  WiFi SSID:      %s\n", cfg.wifiSsid[0] ? cfg.wifiSsid : "(unset)");
-  Serial.printf("  WiFi password:  %s\n", cfg.wifiPass[0] ? "********" : "(unset)");
-  Serial.printf("  MQTT broker:    %s\n", cfg.mqttHost[0] ? cfg.mqttHost : "(unset)");
-  Serial.printf("  MQTT port:      %u\n", cfg.mqttPort);
-  Serial.printf("  MQTT user:      %s\n", cfg.mqttUser[0] ? cfg.mqttUser : "(empty)");
-  Serial.printf("  MQTT password:  %s\n", cfg.mqttPass[0] ? "********" : "(empty)");
-  Serial.printf("  MQTT topic:     %s\n", cfg.mqttTopic);
-  Serial.printf("  MQTT client ID: %s\n", cfg.mqttClientId);
+  serialPrintln();
+  serialPrintln("---------- Current configuration ----------");
+  serialPrintf("  WiFi enabled:   %s\n", cfg.wifiEnabled ? "yes" : "no");
+  serialPrintf("  MQTT enabled:   %s\n", cfg.mqttEnabled ? "yes" : "no");
+  serialPrintf("  WiFi SSID:      %s\n", cfg.wifiSsid[0] ? cfg.wifiSsid : "(unset)");
+  serialPrintf("  WiFi password:  %s\n", cfg.wifiPass[0] ? "********" : "(unset)");
+  serialPrintf("  MQTT broker:    %s\n", cfg.mqttHost[0] ? cfg.mqttHost : "(unset)");
+  serialPrintf("  MQTT port:      %u\n", cfg.mqttPort);
+  serialPrintf("  MQTT user:      %s\n", cfg.mqttUser[0] ? cfg.mqttUser : "(empty)");
+  serialPrintf("  MQTT password:  %s\n", cfg.mqttPass[0] ? "********" : "(empty)");
+  serialPrintf("  MQTT topic:     %s\n", cfg.mqttTopic);
+  serialPrintf("  MQTT client ID: %s\n", cfg.mqttClientId);
   printOptionalCm("  Dist empty:     ", cfg.distEmptyCm);
   printOptionalCm("  Dist full:      ", cfg.distFullCm);
   printOptionalLiters("  Tank volume:    ", cfg.tankLiters);
-  Serial.printf("  Interval:       %u s\n", cfg.intervalSec);
-  Serial.println("-------------------------------------------");
+  serialPrintf("  Interval:       %u s\n", cfg.intervalSec);
+  serialPrintf("  Serial EOL:     %s\n", serialEolName(serialEol));
+  serialPrintln("-------------------------------------------");
 }
 
-// -------------------- WiFi / MQTT --------------------
-void disconnectNetwork() {
-  mqtt.disconnect();
-  WiFi.disconnect(true);
+// -------------------- WiFi / MQTT / power --------------------
+void tearDownNetwork() {
+  if (mqtt.connected()) {
+    mqtt.disconnect();
+  }
+  if (WiFi.getMode() != WIFI_OFF) {
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+  }
+  esp_wifi_stop();
   wifiOk = false;
   mqttOk = false;
 }
 
-bool connectWifi(uint32_t timeoutMs = CFG_WIFI_TIMEOUT_MS) {
+void powerDownUnused() {
+  tearDownNetwork();
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+  btStop();
+#endif
+}
+
+bool connectWifiOnce(uint32_t timeoutMs = CFG_WIFI_TIMEOUT_MS) {
   if (!cfg.wifiEnabled) {
-    Serial.println("WiFi: disabled.");
+    serialPrintln("WiFi: disabled.");
     wifiOk = false;
     return false;
   }
   if (cfg.wifiSsid[0] == '\0') {
-    Serial.println("WiFi: no SSID configured.");
+    serialPrintln("WiFi: no SSID configured.");
     wifiOk = false;
     return false;
   }
 
-  Serial.printf("WiFi: connecting to '%s' ...\n", cfg.wifiSsid);
+  serialPrintf("WiFi: connecting to '%s' ...\n", cfg.wifiSsid);
+  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true);
   WiFi.begin(cfg.wifiSsid, cfg.wifiPass);
 
   uint32_t start = millis();
@@ -297,36 +492,53 @@ bool connectWifi(uint32_t timeoutMs = CFG_WIFI_TIMEOUT_MS) {
     delay(250);
     Serial.print(".");
   }
-  Serial.println();
+  serialPrintln();
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("WiFi: connected, IP ");
-    Serial.println(WiFi.localIP());
+    serialPrintln(WiFi.localIP());
     wifiOk = true;
     return true;
   }
 
-  Serial.println("WiFi: connection failed.");
+  serialPrintln("WiFi: connection failed.");
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
   wifiOk = false;
   return false;
 }
 
-bool connectMqtt() {
+bool connectWifiWithRetry() {
+  for (int attempt = 1; attempt <= CFG_NET_RETRIES; attempt++) {
+    serialPrintf("WiFi attempt %d/%d\n", attempt, CFG_NET_RETRIES);
+    if (connectWifiOnce()) {
+      return true;
+    }
+    if (attempt < CFG_NET_RETRIES) {
+      delay(CFG_NET_RETRY_DELAY_MS);
+    }
+  }
+  serialPrintln("WiFi: all retries failed.");
+  return false;
+}
+
+bool connectMqttOnce() {
   if (!cfg.mqttEnabled) {
-    Serial.println("MQTT: disabled.");
+    serialPrintln("MQTT: disabled.");
     mqttOk = false;
     return false;
   }
   if (!wifiOk || cfg.mqttHost[0] == '\0') {
     if (cfg.mqttEnabled && cfg.wifiEnabled) {
-      Serial.println("MQTT: broker or WiFi missing.");
+      serialPrintln("MQTT: broker or WiFi missing.");
     }
     mqttOk = false;
     return false;
   }
 
   mqtt.setServer(cfg.mqttHost, cfg.mqttPort);
-  Serial.printf("MQTT: connecting to %s:%u ...\n", cfg.mqttHost, cfg.mqttPort);
+  mqtt.setSocketTimeout(5);
+  serialPrintf("MQTT: connecting to %s:%u ...\n", cfg.mqttHost, cfg.mqttPort);
 
   bool ok;
   if (cfg.mqttUser[0] != '\0') {
@@ -336,51 +548,99 @@ bool connectMqtt() {
   }
 
   if (ok) {
-    Serial.println("MQTT: connected.");
+    serialPrintln("MQTT: connected.");
     mqttOk = true;
   } else {
-    Serial.printf("MQTT: failed (state=%d).\n", mqtt.state());
+    serialPrintf("MQTT: failed (state=%d).\n", mqtt.state());
     mqttOk = false;
   }
   return ok;
 }
 
-void ensureConnectivity() {
-  if (!cfg.wifiEnabled) {
-    if (WiFi.status() == WL_CONNECTED || mqtt.connected()) {
-      disconnectNetwork();
+bool connectMqttWithRetry() {
+  for (int attempt = 1; attempt <= CFG_NET_RETRIES; attempt++) {
+    serialPrintf("MQTT attempt %d/%d\n", attempt, CFG_NET_RETRIES);
+    if (connectMqttOnce()) {
+      return true;
     }
-    return;
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    wifiOk = false;
-    mqttOk = false;
-    connectWifi();
-  }
-
-  if (!cfg.mqttEnabled) {
-    if (mqtt.connected()) {
-      mqtt.disconnect();
+    if (attempt < CFG_NET_RETRIES) {
+      delay(CFG_NET_RETRY_DELAY_MS);
     }
-    mqttOk = false;
-    return;
   }
-
-  if (wifiOk && !mqtt.connected()) {
-    mqttOk = false;
-    connectMqtt();
-  }
+  serialPrintln("MQTT: all retries failed.");
+  return false;
 }
 
-void applyNetworkFromConfig() {
-  disconnectNetwork();
-  if (cfg.wifiEnabled) {
-    connectWifi();
-    if (cfg.mqttEnabled) {
-      connectMqtt();
+bool publishDistance(float distanceCm);
+
+// Bring network up only for a publish, then always tear down
+bool publishWithNetwork(float distanceCm) {
+  if (!cfg.wifiEnabled || !cfg.mqttEnabled) {
+    serialPrintln("Publish skipped (WiFi or MQTT disabled).");
+    return false;
+  }
+
+  bool ok = false;
+  if (connectWifiWithRetry() && connectMqttWithRetry()) {
+    ok = publishDistance(distanceCm);
+    delay(50);
+    mqtt.loop();
+  }
+  tearDownNetwork();
+  return ok;
+}
+
+void testNetworkReconnect() {
+  serialPrintln("Network test (connect with retries, then disconnect)...");
+  if (connectWifiWithRetry() && cfg.mqttEnabled) {
+    connectMqttWithRetry();
+  }
+  tearDownNetwork();
+  serialPrintln("Network test done; radios off.");
+}
+
+// Light sleep: deepest mode that can wake on timer and UART/serial.
+// Sliced so USB-CDC Serial Monitor input is still noticed between wakes.
+bool sleepUntilTimerOrSerial(uint32_t seconds) {
+  powerDownUnused();
+  Serial.flush();
+
+  serialPrintf("Sleeping %u s (light sleep, wake: timer or serial)...\n", seconds);
+  Serial.flush();
+
+  const uint32_t sliceMs =
+      CFG_SLEEP_SLICE_MS < 100 ? 100 : (uint32_t)CFG_SLEEP_SLICE_MS;
+  uint32_t remainingMs = seconds * 1000UL;
+
+  while (remainingMs > 0) {
+    if (Serial.available()) {
+      return true;
+    }
+
+    uint32_t thisSlice = remainingMs < sliceMs ? remainingMs : sliceMs;
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    esp_sleep_enable_timer_wakeup((uint64_t)thisSlice * 1000ULL);
+
+    // Hardware UART0 RX can wake light sleep (USB-CDC may still need slice polling)
+    uart_set_wakeup_threshold(UART_NUM_0, 3);
+    esp_err_t uartWake = esp_sleep_enable_uart_wakeup(UART_NUM_0);
+    (void)uartWake;
+
+    esp_light_sleep_start();
+
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (cause == ESP_SLEEP_WAKEUP_UART || Serial.available()) {
+      return true;
+    }
+
+    if (remainingMs > thisSlice) {
+      remainingMs -= thisSlice;
+    } else {
+      remainingMs = 0;
     }
   }
+
+  return false;
 }
 
 // -------------------- Sensor / level --------------------
@@ -440,17 +700,18 @@ bool distanceToLevelPct(float distanceCm, float &pct) {
 }
 
 void printMeasurement(float distanceCm) {
-  Serial.printf("Distance: %.1f cm", distanceCm);
-
   float pct;
   if (distanceToLevelPct(distanceCm, pct)) {
-    Serial.printf(" | Level: %.1f %%", pct);
     if (!isnan(cfg.tankLiters)) {
       float liters = pct / 100.0f * cfg.tankLiters;
-      Serial.printf(" | %.1f liters", liters);
+      serialPrintf("Distance: %.1f cm | Level: %.1f %% | %.1f liters\n",
+                   distanceCm, pct, liters);
+    } else {
+      serialPrintf("Distance: %.1f cm | Level: %.1f %%\n", distanceCm, pct);
     }
+  } else {
+    serialPrintf("Distance: %.1f cm\n", distanceCm);
   }
-  Serial.println();
 }
 
 bool publishDistance(float distanceCm) {
@@ -462,35 +723,50 @@ bool publishDistance(float distanceCm) {
   snprintf(payload, sizeof(payload), "%.1f", distanceCm);
 
   bool ok = mqtt.publish(cfg.mqttTopic, payload, true);
-  Serial.printf("MQTT -> %s : %s %s\n", cfg.mqttTopic, payload, ok ? "OK" : "FAIL");
+  serialPrintf("MQTT -> %s : %s %s\n", cfg.mqttTopic, payload, ok ? "OK" : "FAIL");
   return ok;
+}
+
+void runMeasureCycle() {
+  float distanceCm = 0.0f;
+  if (readDistanceCm(distanceCm)) {
+    printMeasurement(distanceCm);
+    if (cfg.wifiEnabled && cfg.mqttEnabled) {
+      publishWithNetwork(distanceCm);
+    }
+  } else {
+    serialPrintln("Sensor: measurement failed / timeout.");
+  }
+  powerDownUnused();
 }
 
 // -------------------- Menu --------------------
 void showMenuHelp() {
-  Serial.println();
-  Serial.println("=========== Oil tank configuration ===========");
-  Serial.println("  0  WiFi enabled (0/1)");
-  Serial.println("  1  WiFi SSID");
-  Serial.println("  2  WiFi password");
-  Serial.println("  3  MQTT enabled (0/1)");
-  Serial.println("  4  MQTT broker");
-  Serial.println("  5  MQTT port");
-  Serial.println("  6  MQTT user");
-  Serial.println("  7  MQTT password");
-  Serial.println("  8  MQTT topic");
-  Serial.println("  9  MQTT client ID");
-  Serial.println("  a  Distance empty (cm, optional)");
-  Serial.println("  b  Distance full (cm, optional)");
-  Serial.println("  c  Tank volume (liters, optional)");
-  Serial.println("  d  Measure interval (s)");
-  Serial.println("  s  Show status / configuration");
-  Serial.println("  t  Test measurement");
-  Serial.println("  w  Reconnect WiFi + MQTT");
-  Serial.println("  x  Save and leave menu");
-  Serial.println("  q  Quit without saving");
-  Serial.println("==============================================");
-  Serial.println("Empty input = keep value, '-' = clear field");
+  serialPrintln();
+  serialPrintln("=========== Oil tank configuration ===========");
+  serialPrintln("  0  WiFi enabled (0/1)");
+  serialPrintln("  1  WiFi SSID");
+  serialPrintln("  2  WiFi password");
+  serialPrintln("  3  MQTT enabled (0/1)");
+  serialPrintln("  4  MQTT broker");
+  serialPrintln("  5  MQTT port");
+  serialPrintln("  6  MQTT user");
+  serialPrintln("  7  MQTT password");
+  serialPrintln("  8  MQTT topic");
+  serialPrintln("  9  MQTT client ID");
+  serialPrintln("  a  Distance empty (cm, optional)");
+  serialPrintln("  b  Distance full (cm, optional)");
+  serialPrintln("  c  Tank volume (liters, optional)");
+  serialPrintln("  d  Measure interval (s)");
+  serialPrintln("  e  Serial line ending (0=auto 1=LF 2=CR 3=CRLF)");
+  serialPrintln("  s  Show status / configuration");
+  serialPrintln("  t  Test measurement");
+  serialPrintln("  u  EOL consistency self-test");
+  serialPrintln("  w  Test WiFi + MQTT (retry 3x, then power off)");
+  serialPrintln("  x  Save and leave menu");
+  serialPrintln("  q  Quit without saving");
+  serialPrintln("==============================================");
+  serialPrintln("Empty input = keep value, '-' = clear field");
 }
 
 void runMenu() {
@@ -556,15 +832,31 @@ void runMenu() {
         cfg.intervalSec = (uint16_t)v;
         break;
       }
+      case 'e':
+      case 'E': {
+        serialPrintf("Current serial EOL: %s\n", serialEolName(serialEol));
+        serialPrintln("  0 = auto (learn from Enter)");
+        serialPrintln("  1 = LF   (0x0A)");
+        serialPrintln("  2 = CR   (0x0D)");
+        serialPrintln("  3 = CRLF (0x0D 0x0A)");
+        int v = readInt("Serial line ending", (int)serialEol);
+        if (v >= 0 && v <= 3) {
+          applySerialEol((SerialEol)v);
+          serialPrintf("Serial EOL set to %s\n", serialEolName(serialEol));
+        } else {
+          serialPrintln("Invalid value (use 0..3).");
+        }
+        break;
+      }
       case 's':
       case 'S':
         printConfig();
-        Serial.printf("  WiFi status:    %s\n",
-                      !cfg.wifiEnabled ? "disabled"
-                                       : (WiFi.status() == WL_CONNECTED ? "connected" : "disconnected"));
-        Serial.printf("  MQTT status:    %s\n",
-                      !cfg.mqttEnabled ? "disabled"
-                                       : (mqtt.connected() ? "connected" : "disconnected"));
+        serialPrintf("  WiFi status:    %s\n",
+                     !cfg.wifiEnabled ? "disabled"
+                                      : (WiFi.status() == WL_CONNECTED ? "connected" : "disconnected"));
+        serialPrintf("  MQTT status:    %s\n",
+                     !cfg.mqttEnabled ? "disabled"
+                                      : (mqtt.connected() ? "connected" : "disconnected"));
         break;
       case 't':
       case 'T': {
@@ -572,25 +864,38 @@ void runMenu() {
         if (readDistanceCm(d)) {
           printMeasurement(d);
         } else {
-          Serial.println("Measurement failed.");
+          serialPrintln("Measurement failed.");
         }
         break;
       }
+      case 'u':
+      case 'U':
+        if (selfTestSerialEol()) {
+          serialPrintln("EOL self-test OK (LF / CR / CRLF mappings + cfg sync).");
+          serialPrintf("Active output EOL: %s\n", serialEolName(serialEol));
+          serialPrintln("Sample line 1");
+          serialPrintln("Sample line 2");
+        } else {
+          serialPrintln("EOL self-test FAIL.");
+        }
+        break;
       case 'w':
       case 'W':
-        applyNetworkFromConfig();
+        testNetworkReconnect();
         break;
       case 'x':
       case 'X':
         saveConfig();
-        applyNetworkFromConfig();
-        Serial.println("Menu closed. Measurement continues.");
+        powerDownUnused();
+        serialPrintln("Menu closed. Measurement continues.");
         flushSerialInput();
         return;
       case 'q':
       case 'Q':
         cfg = backup;
-        Serial.println("Changes discarded. Menu closed.");
+        applySerialEol((SerialEol)cfg.serialEol);
+        powerDownUnused();
+        serialPrintln("Changes discarded. Menu closed.");
         flushSerialInput();
         return;
       case 'h':
@@ -599,25 +904,10 @@ void runMenu() {
         showMenuHelp();
         break;
       default:
-        Serial.println("Unknown choice. Type ? for help.");
+        serialPrintln("Unknown choice. Type ? for help.");
         break;
     }
   }
-}
-
-bool waitIntervalOrMenu(uint16_t seconds) {
-  uint32_t end = millis() + (uint32_t)seconds * 1000UL;
-  while (millis() < end) {
-    if (Serial.available()) {
-      flushSerialInput();
-      return true;
-    }
-    if (cfg.mqttEnabled && mqtt.connected()) {
-      mqtt.loop();
-    }
-    delay(50);
-  }
-  return false;
 }
 
 // -------------------- Setup / Loop --------------------
@@ -628,41 +918,33 @@ void setup() {
   SensorSerial.begin(SENSOR_BAUD, SERIAL_8N1, SENSOR_RX_PIN, SENSOR_TX_PIN);
 
   loadConfig();
+  powerDownUnused();
 
-  Serial.println();
-  Serial.println("=========================================");
-  Serial.println("  Oil tank level (JSN-SR04T + MQTT)");
-  Serial.println("  Any key -> configuration menu");
-  Serial.println("=========================================");
+  serialPrintln();
+  serialPrintln("=========================================");
+  serialPrintln("  UltraOilPing – ESP32 ultrasonic oil tank");
+  serialPrintln("  level monitor with MQTT");
+  serialPrintln("  Any key -> configuration menu");
+  serialPrintln("  Sleep: light sleep (timer or serial wake)");
+  serialPrintln("=========================================");
   printConfig();
-
-  applyNetworkFromConfig();
+  if (!selfTestSerialEol()) {
+    serialPrintln("WARNING: EOL self-test failed at boot.");
+  }
 }
 
 void loop() {
   if (Serial.available()) {
-    flushSerialInput();
+    consumeSerialWake();
     runMenu();
+    powerDownUnused();
   }
 
-  ensureConnectivity();
+  runMeasureCycle();
 
-  float distanceCm = 0.0f;
-  if (readDistanceCm(distanceCm)) {
-    printMeasurement(distanceCm);
-
-    if (cfg.mqttEnabled) {
-      if (mqtt.connected()) {
-        publishDistance(distanceCm);
-      } else {
-        Serial.println("MQTT not connected – local only.");
-      }
-    }
-  } else {
-    Serial.println("Sensor: measurement failed / timeout.");
-  }
-
-  if (waitIntervalOrMenu(cfg.intervalSec)) {
+  if (sleepUntilTimerOrSerial(cfg.intervalSec)) {
+    consumeSerialWake();
     runMenu();
+    powerDownUnused();
   }
 }

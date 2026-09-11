@@ -1,8 +1,12 @@
-# Öltank-Pegel (JSN-SR04T + MQTT)
+# UltraOilPing – ESP32 ultrasonic oil tank level monitor with MQTT
+
+<p align="center">
+  <img src="assets/logo.png" alt="UltraOilPing Logo" width="320">
+</p>
 
 [English](README.md)
 
-ESP32-Firmware für einen Ultraschallsensor (JSN-SR04T Mode 3), die den Abstand zum Ölspiegel misst und optional per MQTT sendet.
+ESP32-Firmware für einen Ultraschallsensor (JSN-SR04T Mode 3), die den Abstand zum Ölspiegel misst und optional per MQTT sendet. Zwischen den Zyklen geht das Gerät in den Light Sleep und schaltet die Funkmodule ab.
 
 ## Hardware
 
@@ -12,12 +16,24 @@ ESP32-Firmware für einen Ultraschallsensor (JSN-SR04T Mode 3), die den Abstand 
   - GPIO 4 ← Sensor TX
   - GPIO 3 → Sensor RX
 
+### Erster Prototyp
+
+<p align="center">
+  <img src="assets/prototype.png" alt="UltraOilPing erster Prototyp" width="640">
+</p>
+
+ESP32-C3 angeschlossen an JSN-SR04T-Treiberplatine und wasserdichten Ultraschallwandler (Proof-of-Concept-Verdrahtung).
+
 ## Funktionen
 
 - Periodische Distanzmessung
 - Optional Füllstand (%) und Liter, wenn Distanz leer/voll (und Volumen) gesetzt sind
 - MQTT: nur die Distanz als Zahl (z. B. `45.2`)
+- **Pro Messung:** WiFi + MQTT verbinden → senden → trennen / Funk aus
+- WiFi und MQTT jeweils mit **3 Retries**
+- **Light Sleep** zwischen den Zyklen (Wake per Timer oder Serial); ungenutzte Radios aus
 - Serielles Konfigurationsmenü (beliebiges Zeichen im Serial Monitor)
+- Zeilenende CR / LF / CRLF wird von Enter gelernt und im NVS gespeichert
 - Persistenz im ESP32-NVS
 - Compile-Zeit-Defaults in `config.h`
 
@@ -37,6 +53,15 @@ ESP32-Firmware für einen Ultraschallsensor (JSN-SR04T Mode 3), die den Abstand 
 
 Ohne Einträge in `config.h` kann alles auch nur über das serielle Menü eingerichtet werden.
 
+## Betriebszyklus
+
+1. Distanz messen (und Füllstand/Liter ausgeben, falls kalibriert)
+2. Wenn WiFi und MQTT aktiv: verbinden (je bis 3 Versuche) → publish → Netzwerk abbauen
+3. Light Sleep bis zum Messintervall **oder** bis Serieneingabe
+4. Serial-Wake öffnet das Konfigurationsmenü
+
+Light Sleep statt Deep Sleep, damit Wake per Timer **und** Serial möglich ist (UART-Wakeup + kurze Sleep-Slices für USB-CDC Serial Monitor).
+
 ## Konfiguration
 
 ### `config.h` (Defaults beim Compile)
@@ -48,7 +73,11 @@ Ohne Einträge in `config.h` kann alles auch nur über das serielle Menü einger
 | `CFG_MQTT_*` | Broker, Port, User, Passwort, Topic, Client-ID |
 | `CFG_DIST_EMPTY_SET` / `CFG_DIST_FULL_SET` | Kalibrierung aktivieren |
 | `CFG_TANK_LITERS_SET` | Tankvolumen aktivieren |
-| `CFG_INTERVAL_SEC` | Messintervall |
+| `CFG_INTERVAL_SEC` | Mess-/Sleep-Intervall |
+| `CFG_NET_RETRIES` | Verbindungsversuche WiFi/MQTT (Standard 3) |
+| `CFG_NET_RETRY_DELAY_MS` | Pause zwischen Retries |
+| `CFG_SLEEP_SLICE_MS` | Light-Sleep-Slice (Serial-Poll / UART-Wake) |
+| `CFG_SERIAL_EOL` | Konsolen-Zeilenende: 0=auto, 1=LF, 2=CR, 3=CRLF |
 
 **Hinweis:** Für ein öffentliches Repo keine echten Passwörter in `config.h` committen – lieber das serielle Menü nutzen.
 
@@ -61,15 +90,28 @@ Ohne Einträge in `config.h` kann alles auch nur über das serielle Menü einger
 | `4`–`9` | MQTT-Parameter |
 | `a`–`c` | Distanz leer/voll, Tankvolumen (`-` löscht) |
 | `d` | Messintervall |
-| `s` / `t` / `w` | Status / Test / neu verbinden |
+| `e` | Serielles Zeilenende (0=auto, 1=LF, 2=CR, 3=CRLF) |
+| `s` | Status / Konfiguration |
+| `t` | Testmessung |
+| `u` | EOL-Konsistenz-Self-Test |
+| `w` | WiFi + MQTT testen (3× Retry, danach Funk aus) |
 | `x` / `q` | Speichern & Exit / Abbruch |
+
+Enter wird als CR (`0x0D`), LF (`0x0A`) oder CRLF akzeptiert. Der erkannte Stil gilt für die Menüausgabe und kann gespeichert werden.
 
 ## MQTT
 
 - Topic: laut Konfiguration (Default `oiltank/distance`)
 - Payload: Distanz in cm, eine Dezimalstelle, z. B. `123.4`
 - Retain: aktiv
+- Verbindung nur für jedes Publish, danach wieder getrennt
 
 ## Lizenz
 
-[GNU General Public License v3.0](LICENSE)
+Dieses Projekt steht unter der [GNU General Public License v3.0](LICENSE).
+
+### Logo
+
+Das UltraOilPing-Logo (`assets/logo.png`) steht unter der [GNU General Public License v3.0](LICENSE).
+
+Es wurde mit ChatGPT (OpenAI) generiert.

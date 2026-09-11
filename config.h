@@ -46,7 +46,17 @@
 #define CFG_TANK_LITERS     1000.0f  // volume at 100 %
 
 // -------------------- Operation --------------------
-#define CFG_INTERVAL_SEC    30       // measure / publish interval (seconds)
-#define CFG_WIFI_TIMEOUT_MS 15000
+#define CFG_INTERVAL_SEC       30       // measure / publish interval (seconds)
+#define CFG_WIFI_TIMEOUT_MS    15000
+#define CFG_NET_RETRIES        3        // WiFi / MQTT connect attempts
+#define CFG_NET_RETRY_DELAY_MS 1000     // pause between retries
+#define CFG_SLEEP_SLICE_MS     1000     // light-sleep slice (timer + UART/serial poll)
+
+// Serial line ending for menu / console output:
+//   0 = auto (CRLF until first Enter, then learn CR / LF / CRLF)
+//   1 = LF   (0x0A)
+//   2 = CR   (0x0D)
+//   3 = CRLF (0x0D 0x0A)
+#define CFG_SERIAL_EOL      0
 
 #endif  // CONFIG_H
