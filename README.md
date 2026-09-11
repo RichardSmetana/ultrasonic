@@ -6,15 +6,27 @@
 
 [Deutsch](README.de.md)
 
-ESP32 firmware for an ultrasonic sensor (JSN-SR04T mode 3) that measures the distance to the oil surface and optionally publishes it via MQTT. Between cycles the device enters light sleep and powers the radios down.
+ESP32 firmware for an ultrasonic sensor ([JSN-SR04T-V3.3](https://esphome.io/components/sensor/jsn_sr04t/) in Mode 2 / M2) that measures the distance to the oil surface and optionally publishes it via MQTT. Between cycles the device enters light sleep and powers the radios down.
 
 ## Hardware
 
-- ESP32 (tested with ESP32-C3)
-- JSN-SR04T-V3.3 in mode 3 (120 kΩ), UART 9600 baud
-- Default pins (change in `config.h`):
-  - GPIO 4 ← sensor TX
-  - GPIO 3 → sensor RX
+### Microcontroller
+
+- **[ESP32-C3 SuperMini](https://randomnerdtutorials.com/getting-started-esp32-c3-super-mini/)** (used in this project)
+  - Compact ESP32-C3 board with USB-C
+  - Pinout / specs: [Mischianti](https://mischianti.org/esp32-c3-super-mini-high-resolution-pinout-datasheet-and-specs/), [Last Minute Engineers](https://lastminuteengineers.com/esp32-c3-super-mini-pinout-reference/)
+
+### Ultrasonic sensor
+
+- **[JSN-SR04T-V3.3](https://esphome.io/components/sensor/jsn_sr04t/)** waterproof ultrasonic module (UART)
+  - Datasheet (EN): [JSN-SR04T-V3.3 (translated PDF)](https://make.net.za/wp-content/datasheets/JSN-SR04T-V3.3%20Datasheet%20-%20Translated.pdf)
+  - **Mode setup used here:** solder bridge **M2** on the module PCB (Mode 2 / ~120 kΩ) → UART-controlled output; trigger with `0x55` at 9600 baud
+  - Mode overview: [Sigmanortec – JSN-SR04T v3.3](https://sigmanortec.ro/en/ultrasonic-sensor-module-jsn-sr04t-v33-waterproof-3-5v)
+
+### Wiring (defaults in `config.h`)
+
+- GPIO 4 ← sensor TX
+- GPIO 3 → sensor RX
 
 ### First prototype
 
@@ -22,7 +34,7 @@ ESP32 firmware for an ultrasonic sensor (JSN-SR04T mode 3) that measures the dis
   <img src="assets/prototype.png" alt="UltraOilPing first prototype" width="640">
 </p>
 
-ESP32-C3 connected to a JSN-SR04T driver board and waterproof ultrasonic transducer (proof-of-concept wiring).
+ESP32-C3 SuperMini connected to a JSN-SR04T-V3.3 driver board (M2 soldered) and waterproof ultrasonic transducer (proof-of-concept wiring).
 
 ## Features
 
@@ -40,7 +52,7 @@ ESP32-C3 connected to a JSN-SR04T driver board and waterproof ultrasonic transdu
 ## Requirements
 
 - Arduino IDE or PlatformIO
-- Board: ESP32
+- Board: **ESP32-C3 SuperMini** (Arduino board: “ESP32C3 Dev Module”, enable **USB CDC On Boot**)
 - Library: [PubSubClient](https://github.com/knolleary/pubsubclient) (Nick O’Leary)
 
 ## Quick start

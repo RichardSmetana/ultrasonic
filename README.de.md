@@ -6,15 +6,27 @@
 
 [English](README.md)
 
-ESP32-Firmware für einen Ultraschallsensor (JSN-SR04T Mode 3), die den Abstand zum Ölspiegel misst und optional per MQTT sendet. Zwischen den Zyklen geht das Gerät in den Light Sleep und schaltet die Funkmodule ab.
+ESP32-Firmware für einen Ultraschallsensor ([JSN-SR04T-V3.3](https://esphome.io/components/sensor/jsn_sr04t/) in Mode 2 / M2), die den Abstand zum Ölspiegel misst und optional per MQTT sendet. Zwischen den Zyklen geht das Gerät in den Light Sleep und schaltet die Funkmodule ab.
 
 ## Hardware
 
-- ESP32 (getestet mit ESP32-C3)
-- JSN-SR04T-V3.3 im Mode 3 (120 kΩ), UART 9600 Baud
-- Standard-Pins (änderbar in `config.h`):
-  - GPIO 4 ← Sensor TX
-  - GPIO 3 → Sensor RX
+### Mikrocontroller
+
+- **[ESP32-C3 SuperMini](https://randomnerdtutorials.com/getting-started-esp32-c3-super-mini/)** (in diesem Projekt verwendet)
+  - Kompaktes ESP32-C3-Board mit USB-C
+  - Pinout / Specs: [Mischianti](https://mischianti.org/esp32-c3-super-mini-high-resolution-pinout-datasheet-and-specs/), [Last Minute Engineers](https://lastminuteengineers.com/esp32-c3-super-mini-pinout-reference/)
+
+### Ultraschallsensor
+
+- **[JSN-SR04T-V3.3](https://esphome.io/components/sensor/jsn_sr04t/)** wasserdichtes Ultraschallmodul (UART)
+  - Datenblatt (EN): [JSN-SR04T-V3.3 (übersetztes PDF)](https://make.net.za/wp-content/datasheets/JSN-SR04T-V3.3%20Datasheet%20-%20Translated.pdf)
+  - **Hier verwendete Mode-Einstellung:** Lötbrücke **M2** auf der Modul-Platine (Mode 2 / ca. 120 kΩ) → UART-gesteuerte Ausgabe; Trigger mit `0x55` bei 9600 Baud
+  - Mode-Übersicht: [Sigmanortec – JSN-SR04T v3.3](https://sigmanortec.ro/en/ultrasonic-sensor-module-jsn-sr04t-v33-waterproof-3-5v)
+
+### Verdrahtung (Defaults in `config.h`)
+
+- GPIO 4 ← Sensor TX
+- GPIO 3 → Sensor RX
 
 ### Erster Prototyp
 
@@ -22,7 +34,7 @@ ESP32-Firmware für einen Ultraschallsensor (JSN-SR04T Mode 3), die den Abstand 
   <img src="assets/prototype.png" alt="UltraOilPing erster Prototyp" width="640">
 </p>
 
-ESP32-C3 angeschlossen an JSN-SR04T-Treiberplatine und wasserdichten Ultraschallwandler (Proof-of-Concept-Verdrahtung).
+ESP32-C3 SuperMini angeschlossen an JSN-SR04T-V3.3-Treiberplatine (M2 gelötet) und wasserdichten Ultraschallwandler (Proof-of-Concept-Verdrahtung).
 
 ## Funktionen
 
@@ -40,7 +52,7 @@ ESP32-C3 angeschlossen an JSN-SR04T-Treiberplatine und wasserdichten Ultraschall
 ## Voraussetzungen
 
 - Arduino IDE oder PlatformIO
-- Board: ESP32
+- Board: **ESP32-C3 SuperMini** (Arduino-Board: „ESP32C3 Dev Module“, **USB CDC On Boot** aktivieren)
 - Bibliothek: [PubSubClient](https://github.com/knolleary/pubsubclient) (Nick O’Leary)
 
 ## Schnellstart
