@@ -8,6 +8,7 @@
 #include <esp_sleep.h>
 #include <esp_wifi.h>
 #include <driver/uart.h>
+#include <driver/gpio.h>
 #include "config.h"
 
 HardwareSerial SensorSerial(SENSOR_UART_NUM);
@@ -27,19 +28,68 @@ struct Config {
   char mqttPass[65];
   char mqttTopic[64];
   char mqttClientId[33];
-  float distEmptyCm;
-  float distFullCm;
+  float distEmptyMm;
+  float distFullMm;
+  float distMaxMm;    // error if measured distance > this (unset = no limit)
   float tankLiters;
   uint16_t intervalSec;
+  uint16_t idleTimeoutSec;  // grace before power-save after reset / serial
   uint8_t serialEol;  // SerialEol value, persisted
 } cfg;
 
 bool wifiOk = false;
 bool mqttOk = false;
+bool pendingIdleGrace = true;  // true after reset; also after serial menu
 
 // Line ending for console output (CR / LF / CRLF); synced with cfg.serialEol
 enum SerialEol : uint8_t { EOL_UNKNOWN = 0, EOL_LF = 1, EOL_CR = 2, EOL_CRLF = 3 };
 SerialEol serialEol = EOL_UNKNOWN;
+
+enum class WakeSource : uint8_t { Timer = 0, SerialIn = 1, Button = 2 };
+enum class IdleEvent : uint8_t { Done = 0, SerialIn = 1, Button = 2 };
+
+// -------------------- LED / BOOT button --------------------
+void ledSet(bool on) {
+#if CFG_LED_ACTIVE_LOW
+  digitalWrite(LED_PIN, on ? LOW : HIGH);
+#else
+  digitalWrite(LED_PIN, on ? HIGH : LOW);
+#endif
+}
+
+void ledBlink(uint8_t times) {
+  for (uint8_t i = 0; i < times; i++) {
+    ledSet(true);
+    delay(CFG_LED_BLINK_MS);
+    ledSet(false);
+    if (i + 1 < times) {
+      delay(CFG_LED_BLINK_MS);
+    }
+  }
+}
+
+bool bootButtonPressed() {
+  return digitalRead(BOOT_BTN_PIN) == LOW;
+}
+
+void waitBootButtonRelease() {
+  uint32_t start = millis();
+  while (bootButtonPressed() && (millis() - start) < 3000UL) {
+    delay(10);
+  }
+  delay(40);
+}
+
+void setupButtonAndLed() {
+  pinMode(LED_PIN, OUTPUT);
+  ledSet(false);
+  pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+}
+
+void enableButtonSleepWakeup() {
+  gpio_wakeup_enable((gpio_num_t)BOOT_BTN_PIN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+}
 
 // -------------------- Serial helpers --------------------
 void flushSerialInput() {
@@ -308,10 +358,12 @@ void applyCompileDefaults() {
   copyStr(cfg.mqttPass, sizeof(cfg.mqttPass), CFG_MQTT_PASSWORD);
   copyStr(cfg.mqttTopic, sizeof(cfg.mqttTopic), CFG_MQTT_TOPIC);
   copyStr(cfg.mqttClientId, sizeof(cfg.mqttClientId), CFG_MQTT_CLIENT_ID);
-  cfg.distEmptyCm = CFG_DIST_EMPTY_SET ? CFG_DIST_EMPTY_CM : NAN;
-  cfg.distFullCm = CFG_DIST_FULL_SET ? CFG_DIST_FULL_CM : NAN;
+  cfg.distEmptyMm = CFG_DIST_EMPTY_SET ? CFG_DIST_EMPTY_MM : NAN;
+  cfg.distFullMm = CFG_DIST_FULL_SET ? CFG_DIST_FULL_MM : NAN;
+  cfg.distMaxMm = CFG_DIST_MAX_SET ? CFG_DIST_MAX_MM : NAN;
   cfg.tankLiters = CFG_TANK_LITERS_SET ? CFG_TANK_LITERS : NAN;
   cfg.intervalSec = CFG_INTERVAL_SEC;
+  cfg.idleTimeoutSec = CFG_IDLE_TIMEOUT_SEC;
   cfg.serialEol = (uint8_t)CFG_SERIAL_EOL;
   if (cfg.serialEol > (uint8_t)EOL_CRLF) {
     cfg.serialEol = (uint8_t)EOL_UNKNOWN;
@@ -337,25 +389,37 @@ void loadConfig() {
   prefs.getString("mqttPass", cfg.mqttPass, sizeof(cfg.mqttPass));
   prefs.getString("mqttTopic", cfg.mqttTopic, sizeof(cfg.mqttTopic));
   prefs.getString("mqttClient", cfg.mqttClientId, sizeof(cfg.mqttClientId));
-  if (prefs.isKey("distEmpty")) {
-    cfg.distEmptyCm = prefs.getFloat("distEmpty", NAN);
+  if (prefs.isKey("distEmptyMm")) {
+    cfg.distEmptyMm = prefs.getFloat("distEmptyMm", NAN);
+  } else if (prefs.isKey("distEmpty")) {
+    // migrate legacy cm → mm
+    cfg.distEmptyMm = prefs.getFloat("distEmpty", NAN) * 10.0f;
   }
-  if (prefs.isKey("distFull")) {
-    cfg.distFullCm = prefs.getFloat("distFull", NAN);
+  if (prefs.isKey("distFullMm")) {
+    cfg.distFullMm = prefs.getFloat("distFullMm", NAN);
+  } else if (prefs.isKey("distFull")) {
+    cfg.distFullMm = prefs.getFloat("distFull", NAN) * 10.0f;
+  }
+  if (prefs.isKey("distMaxMm")) {
+    cfg.distMaxMm = prefs.getFloat("distMaxMm", NAN);
   }
   if (prefs.isKey("tankLiters")) {
     cfg.tankLiters = prefs.getFloat("tankLiters", NAN);
   }
   if (prefs.isKey("clrEmpty") && prefs.getBool("clrEmpty", false)) {
-    cfg.distEmptyCm = NAN;
+    cfg.distEmptyMm = NAN;
   }
   if (prefs.isKey("clrFull") && prefs.getBool("clrFull", false)) {
-    cfg.distFullCm = NAN;
+    cfg.distFullMm = NAN;
+  }
+  if (prefs.isKey("clrMax") && prefs.getBool("clrMax", false)) {
+    cfg.distMaxMm = NAN;
   }
   if (prefs.isKey("clrLiters") && prefs.getBool("clrLiters", false)) {
     cfg.tankLiters = NAN;
   }
   cfg.intervalSec = prefs.getUShort("interval", cfg.intervalSec);
+  cfg.idleTimeoutSec = prefs.getUShort("idleTo", cfg.idleTimeoutSec);
   if (prefs.isKey("serialEol")) {
     uint8_t eol = prefs.getUChar("serialEol", cfg.serialEol);
     if (eol <= (uint8_t)EOL_CRLF) {
@@ -380,19 +444,30 @@ void saveConfig() {
   prefs.putString("mqttTopic", cfg.mqttTopic);
   prefs.putString("mqttClient", cfg.mqttClientId);
 
-  if (isnan(cfg.distEmptyCm)) {
+  if (isnan(cfg.distEmptyMm)) {
+    prefs.remove("distEmptyMm");
     prefs.remove("distEmpty");
     prefs.putBool("clrEmpty", true);
   } else {
-    prefs.putFloat("distEmpty", cfg.distEmptyCm);
+    prefs.putFloat("distEmptyMm", cfg.distEmptyMm);
+    prefs.remove("distEmpty");
     prefs.putBool("clrEmpty", false);
   }
-  if (isnan(cfg.distFullCm)) {
+  if (isnan(cfg.distFullMm)) {
+    prefs.remove("distFullMm");
     prefs.remove("distFull");
     prefs.putBool("clrFull", true);
   } else {
-    prefs.putFloat("distFull", cfg.distFullCm);
+    prefs.putFloat("distFullMm", cfg.distFullMm);
+    prefs.remove("distFull");
     prefs.putBool("clrFull", false);
+  }
+  if (isnan(cfg.distMaxMm)) {
+    prefs.remove("distMaxMm");
+    prefs.putBool("clrMax", true);
+  } else {
+    prefs.putFloat("distMaxMm", cfg.distMaxMm);
+    prefs.putBool("clrMax", false);
   }
   if (isnan(cfg.tankLiters)) {
     prefs.remove("tankLiters");
@@ -403,18 +478,19 @@ void saveConfig() {
   }
 
   prefs.putUShort("interval", cfg.intervalSec);
+  prefs.putUShort("idleTo", cfg.idleTimeoutSec);
   cfg.serialEol = (uint8_t)serialEol;
   prefs.putUChar("serialEol", cfg.serialEol);
   prefs.end();
   serialPrintln("Configuration saved.");
 }
 
-void printOptionalCm(const char *label, float value) {
+void printOptionalMm(const char *label, float value) {
   Serial.print(label);
   if (isnan(value)) {
     serialPrintln("(unset)");
   } else {
-    serialPrintf("%.1f cm\n", value);
+    serialPrintf("%.0f mm\n", value);
   }
 }
 
@@ -440,10 +516,12 @@ void printConfig() {
   serialPrintf("  MQTT password:  %s\n", cfg.mqttPass[0] ? "********" : "(empty)");
   serialPrintf("  MQTT topic:     %s\n", cfg.mqttTopic);
   serialPrintf("  MQTT client ID: %s\n", cfg.mqttClientId);
-  printOptionalCm("  Dist empty:     ", cfg.distEmptyCm);
-  printOptionalCm("  Dist full:      ", cfg.distFullCm);
+  printOptionalMm("  Dist empty:     ", cfg.distEmptyMm);
+  printOptionalMm("  Dist full:      ", cfg.distFullMm);
+  printOptionalMm("  Dist max:       ", cfg.distMaxMm);
   printOptionalLiters("  Tank volume:    ", cfg.tankLiters);
   serialPrintf("  Interval:       %u s\n", cfg.intervalSec);
+  serialPrintf("  Idle timeout:   %u s (before power-save)\n", cfg.idleTimeoutSec);
   serialPrintf("  Serial EOL:     %s\n", serialEolName(serialEol));
   serialPrintln("-------------------------------------------");
 }
@@ -571,10 +649,10 @@ bool connectMqttWithRetry() {
   return false;
 }
 
-bool publishDistance(float distanceCm);
+bool publishDistance(uint16_t distanceMm);
 
 // Bring network up only for a publish, then always tear down
-bool publishWithNetwork(float distanceCm) {
+bool publishWithNetwork(uint16_t distanceMm) {
   if (!cfg.wifiEnabled || !cfg.mqttEnabled) {
     serialPrintln("Publish skipped (WiFi or MQTT disabled).");
     return false;
@@ -582,11 +660,19 @@ bool publishWithNetwork(float distanceCm) {
 
   bool ok = false;
   if (connectWifiWithRetry() && connectMqttWithRetry()) {
-    ok = publishDistance(distanceCm);
+    ok = publishDistance(distanceMm);
     delay(50);
     mqtt.loop();
   }
   tearDownNetwork();
+
+  if (ok) {
+    serialPrintln("Publish OK.");
+    ledBlink(1);
+  } else {
+    serialPrintln("Publish failed.");
+    ledBlink(5);
+  }
   return ok;
 }
 
@@ -599,13 +685,12 @@ void testNetworkReconnect() {
   serialPrintln("Network test done; radios off.");
 }
 
-// Light sleep: deepest mode that can wake on timer and UART/serial.
-// Sliced so USB-CDC Serial Monitor input is still noticed between wakes.
-bool sleepUntilTimerOrSerial(uint32_t seconds) {
+// Light sleep: wake on timer, UART/serial, or BOOT button.
+WakeSource sleepUntilWake(uint32_t seconds) {
   powerDownUnused();
   Serial.flush();
 
-  serialPrintf("Sleeping %u s (light sleep, wake: timer or serial)...\n", seconds);
+  serialPrintf("Sleeping %u s (wake: timer / serial / button)...\n", seconds);
   Serial.flush();
 
   const uint32_t sliceMs =
@@ -614,23 +699,30 @@ bool sleepUntilTimerOrSerial(uint32_t seconds) {
 
   while (remainingMs > 0) {
     if (Serial.available()) {
-      return true;
+      return WakeSource::SerialIn;
+    }
+    if (bootButtonPressed()) {
+      return WakeSource::Button;
     }
 
     uint32_t thisSlice = remainingMs < sliceMs ? remainingMs : sliceMs;
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
     esp_sleep_enable_timer_wakeup((uint64_t)thisSlice * 1000ULL);
 
-    // Hardware UART0 RX can wake light sleep (USB-CDC may still need slice polling)
     uart_set_wakeup_threshold(UART_NUM_0, 3);
     esp_err_t uartWake = esp_sleep_enable_uart_wakeup(UART_NUM_0);
     (void)uartWake;
 
+    enableButtonSleepWakeup();
+
     esp_light_sleep_start();
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (cause == ESP_SLEEP_WAKEUP_GPIO || bootButtonPressed()) {
+      return WakeSource::Button;
+    }
     if (cause == ESP_SLEEP_WAKEUP_UART || Serial.available()) {
-      return true;
+      return WakeSource::SerialIn;
     }
 
     if (remainingMs > thisSlice) {
@@ -640,11 +732,70 @@ bool sleepUntilTimerOrSerial(uint32_t seconds) {
     }
   }
 
-  return false;
+  return WakeSource::Timer;
+}
+
+void runMenu();  // defined below (serial configuration menu)
+void runMeasureCycle();
+
+// Stay awake for `seconds` before power-save; serial -> menu, button -> measure.
+IdleEvent waitIdleBeforePowerSave(uint16_t seconds) {
+  if (seconds == 0) {
+    if (Serial.available()) {
+      return IdleEvent::SerialIn;
+    }
+    if (bootButtonPressed()) {
+      return IdleEvent::Button;
+    }
+    return IdleEvent::Done;
+  }
+
+  serialPrintf("Idle %u s before power-save (key=menu, button=measure)...\n", seconds);
+  Serial.flush();
+
+  uint32_t end = millis() + (uint32_t)seconds * 1000UL;
+  while ((int32_t)(millis() - end) < 0) {
+    if (Serial.available()) {
+      return IdleEvent::SerialIn;
+    }
+    if (bootButtonPressed()) {
+      return IdleEvent::Button;
+    }
+    delay(50);
+  }
+  return IdleEvent::Done;
+}
+
+// After reset or serial menu: grace period.
+// Returns true if a button-triggered measure already ran (skip next scheduled measure).
+bool runIdleGraceBeforePowerSave() {
+  while (true) {
+    IdleEvent ev = waitIdleBeforePowerSave(cfg.idleTimeoutSec);
+    if (ev == IdleEvent::Done) {
+      return false;
+    }
+    if (ev == IdleEvent::Button) {
+      serialPrintln("Button: measure + publish cycle.");
+      waitBootButtonRelease();
+      runMeasureCycle();
+      return true;
+    }
+    consumeSerialWake();
+    runMenu();
+    powerDownUnused();
+  }
+}
+
+void runMenuSession() {
+  consumeSerialWake();
+  runMenu();
+  powerDownUnused();
+  // If button was pressed during post-menu idle, measure already ran.
+  (void)runIdleGraceBeforePowerSave();
 }
 
 // -------------------- Sensor / level --------------------
-bool readDistanceCm(float &distanceCm) {
+bool readDistanceMm(uint16_t &distanceMm) {
   while (SensorSerial.available()) {
     SensorSerial.read();
   }
@@ -672,24 +823,27 @@ bool readDistanceCm(float &distanceCm) {
     return false;
   }
 
-  uint16_t distanceMm = ((uint16_t)buf[1] << 8) | buf[2];
-  distanceCm = distanceMm / 10.0f;
+  distanceMm = ((uint16_t)buf[1] << 8) | buf[2];
   return true;
 }
 
 bool hasLevelCalibration() {
-  return !isnan(cfg.distEmptyCm) && !isnan(cfg.distFullCm);
+  return !isnan(cfg.distEmptyMm) && !isnan(cfg.distFullMm);
 }
 
-bool distanceToLevelPct(float distanceCm, float &pct) {
+bool distanceExceedsMax(uint16_t distanceMm) {
+  return !isnan(cfg.distMaxMm) && (float)distanceMm > cfg.distMaxMm;
+}
+
+bool distanceToLevelPct(uint16_t distanceMm, float &pct) {
   if (!hasLevelCalibration()) {
     return false;
   }
-  float span = cfg.distEmptyCm - cfg.distFullCm;
-  if (fabsf(span) < 0.1f) {
+  float span = cfg.distEmptyMm - cfg.distFullMm;
+  if (fabsf(span) < 1.0f) {
     return false;
   }
-  pct = (cfg.distEmptyCm - distanceCm) / span * 100.0f;
+  pct = (cfg.distEmptyMm - (float)distanceMm) / span * 100.0f;
   if (pct < 0.0f) {
     pct = 0.0f;
   }
@@ -699,28 +853,28 @@ bool distanceToLevelPct(float distanceCm, float &pct) {
   return true;
 }
 
-void printMeasurement(float distanceCm) {
+void printMeasurement(uint16_t distanceMm) {
   float pct;
-  if (distanceToLevelPct(distanceCm, pct)) {
+  if (distanceToLevelPct(distanceMm, pct)) {
     if (!isnan(cfg.tankLiters)) {
       float liters = pct / 100.0f * cfg.tankLiters;
-      serialPrintf("Distance: %.1f cm | Level: %.1f %% | %.1f liters\n",
-                   distanceCm, pct, liters);
+      serialPrintf("Distance: %u mm | Level: %.1f %% | %.1f liters\n",
+                   distanceMm, pct, liters);
     } else {
-      serialPrintf("Distance: %.1f cm | Level: %.1f %%\n", distanceCm, pct);
+      serialPrintf("Distance: %u mm | Level: %.1f %%\n", distanceMm, pct);
     }
   } else {
-    serialPrintf("Distance: %.1f cm\n", distanceCm);
+    serialPrintf("Distance: %u mm\n", distanceMm);
   }
 }
 
-bool publishDistance(float distanceCm) {
+bool publishDistance(uint16_t distanceMm) {
   if (!cfg.mqttEnabled || !mqtt.connected()) {
     return false;
   }
 
   char payload[24];
-  snprintf(payload, sizeof(payload), "%.1f", distanceCm);
+  snprintf(payload, sizeof(payload), "%u", distanceMm);
 
   bool ok = mqtt.publish(cfg.mqttTopic, payload, true);
   serialPrintf("MQTT -> %s : %s %s\n", cfg.mqttTopic, payload, ok ? "OK" : "FAIL");
@@ -728,14 +882,25 @@ bool publishDistance(float distanceCm) {
 }
 
 void runMeasureCycle() {
-  float distanceCm = 0.0f;
-  if (readDistanceCm(distanceCm)) {
-    printMeasurement(distanceCm);
-    if (cfg.wifiEnabled && cfg.mqttEnabled) {
-      publishWithNetwork(distanceCm);
-    }
-  } else {
+  uint16_t distanceMm = 0;
+  if (!readDistanceMm(distanceMm)) {
     serialPrintln("Sensor: measurement failed / timeout.");
+    ledBlink(5);
+    powerDownUnused();
+    return;
+  }
+
+  if (distanceExceedsMax(distanceMm)) {
+    serialPrintf("ERROR: distance %u mm exceeds max %.0f mm.\n",
+                 distanceMm, cfg.distMaxMm);
+    ledBlink(5);
+    powerDownUnused();
+    return;
+  }
+
+  printMeasurement(distanceMm);
+  if (cfg.wifiEnabled && cfg.mqttEnabled) {
+    publishWithNetwork(distanceMm);
   }
   powerDownUnused();
 }
@@ -754,10 +919,12 @@ void showMenuHelp() {
   serialPrintln("  7  MQTT password");
   serialPrintln("  8  MQTT topic");
   serialPrintln("  9  MQTT client ID");
-  serialPrintln("  a  Distance empty (cm, optional)");
-  serialPrintln("  b  Distance full (cm, optional)");
+  serialPrintln("  a  Distance empty (mm, optional)");
+  serialPrintln("  b  Distance full (mm, optional)");
   serialPrintln("  c  Tank volume (liters, optional)");
+  serialPrintln("  g  Distance max (mm, optional; over = error)");
   serialPrintln("  d  Measure interval (s)");
+  serialPrintln("  f  Idle timeout before power-save (s)");
   serialPrintln("  e  Serial line ending (0=auto 1=LF 2=CR 3=CRLF)");
   serialPrintln("  s  Show status / configuration");
   serialPrintln("  t  Test measurement");
@@ -813,15 +980,19 @@ void runMenu() {
         break;
       case 'a':
       case 'A':
-        readOptionalFloat("Distance empty (cm)", cfg.distEmptyCm);
+        readOptionalFloat("Distance empty (mm)", cfg.distEmptyMm);
         break;
       case 'b':
       case 'B':
-        readOptionalFloat("Distance full (cm)", cfg.distFullCm);
+        readOptionalFloat("Distance full (mm)", cfg.distFullMm);
         break;
       case 'c':
       case 'C':
         readOptionalFloat("Tank volume (liters)", cfg.tankLiters);
+        break;
+      case 'g':
+      case 'G':
+        readOptionalFloat("Distance max (mm)", cfg.distMaxMm);
         break;
       case 'd':
       case 'D': {
@@ -830,6 +1001,15 @@ void runMenu() {
           v = 1;
         }
         cfg.intervalSec = (uint16_t)v;
+        break;
+      }
+      case 'f':
+      case 'F': {
+        int v = readInt("Idle timeout before power-save (s)", cfg.idleTimeoutSec);
+        if (v < 0) {
+          v = 0;
+        }
+        cfg.idleTimeoutSec = (uint16_t)v;
         break;
       }
       case 'e':
@@ -860,11 +1040,15 @@ void runMenu() {
         break;
       case 't':
       case 'T': {
-        float d;
-        if (readDistanceCm(d)) {
-          printMeasurement(d);
-        } else {
+        uint16_t d;
+        if (!readDistanceMm(d)) {
           serialPrintln("Measurement failed.");
+          ledBlink(5);
+        } else if (distanceExceedsMax(d)) {
+          serialPrintf("ERROR: distance %u mm exceeds max %.0f mm.\n", d, cfg.distMaxMm);
+          ledBlink(5);
+        } else {
+          printMeasurement(d);
         }
         break;
       }
@@ -915,36 +1099,62 @@ void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(1000);
 
+  setupButtonAndLed();
   SensorSerial.begin(SENSOR_BAUD, SERIAL_8N1, SENSOR_RX_PIN, SENSOR_TX_PIN);
 
   loadConfig();
   powerDownUnused();
+  pendingIdleGrace = true;
 
   serialPrintln();
   serialPrintln("=========================================");
   serialPrintln("  UltraOilPing – ESP32 ultrasonic oil tank");
   serialPrintln("  level monitor with MQTT");
   serialPrintln("  Any key -> configuration menu");
-  serialPrintln("  Sleep: light sleep (timer or serial wake)");
+  serialPrintln("  BOOT button -> measure + publish");
+  serialPrintln("  Sleep: timer / serial / button wake");
   serialPrintln("=========================================");
   printConfig();
   if (!selfTestSerialEol()) {
     serialPrintln("WARNING: EOL self-test failed at boot.");
   }
+  ledBlink(1);  // boot indicator
 }
 
 void loop() {
+  bool skipMeasure = false;
+
   if (Serial.available()) {
-    consumeSerialWake();
-    runMenu();
-    powerDownUnused();
+    runMenuSession();
+    pendingIdleGrace = false;
+  } else if (pendingIdleGrace) {
+    skipMeasure = runIdleGraceBeforePowerSave();
+    pendingIdleGrace = false;
+  } else if (bootButtonPressed()) {
+    serialPrintln("Button: measure + publish cycle.");
+    waitBootButtonRelease();
+    runMeasureCycle();
+    skipMeasure = true;
   }
 
-  runMeasureCycle();
+  if (!skipMeasure) {
+    runMeasureCycle();
+  }
 
-  if (sleepUntilTimerOrSerial(cfg.intervalSec)) {
-    consumeSerialWake();
-    runMenu();
-    powerDownUnused();
+  for (;;) {
+    WakeSource wake = sleepUntilWake(cfg.intervalSec);
+    if (wake == WakeSource::SerialIn) {
+      runMenuSession();
+      pendingIdleGrace = false;
+      break;  // continue outer loop -> next measure
+    }
+    if (wake == WakeSource::Button) {
+      serialPrintln("Button wake: measure + publish cycle.");
+      waitBootButtonRelease();
+      runMeasureCycle();
+      continue;  // sleep again without an extra timer measure
+    }
+    // Timer: leave inner loop and run a normal measure cycle
+    break;
   }
 }

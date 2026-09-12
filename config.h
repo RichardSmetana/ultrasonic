@@ -11,11 +11,17 @@
 #define CONFIG_H
 
 // -------------------- Hardware --------------------
-#define SENSOR_RX_PIN     4       // GPIO <- sensor TX
-#define SENSOR_TX_PIN     3       // GPIO -> sensor RX
+#define SENSOR_RX_PIN     3       // GPIO <- sensor TX
+#define SENSOR_TX_PIN     4       // GPIO -> sensor RX
 #define SENSOR_BAUD       9600
 #define SERIAL_BAUD       115200
 #define SENSOR_UART_NUM   1       // HardwareSerial instance
+
+// ESP32-C3 SuperMini: BOOT button and onboard LED
+#define BOOT_BTN_PIN      9       // active LOW (INPUT_PULLUP)
+#define LED_PIN           8       // onboard LED
+#define CFG_LED_ACTIVE_LOW 1
+#define CFG_LED_BLINK_MS  120
 
 // -------------------- Feature switches --------------------
 #define CFG_WIFI_ENABLED  true
@@ -33,20 +39,24 @@
 #define CFG_MQTT_TOPIC     "oiltank/distance"
 #define CFG_MQTT_CLIENT_ID "oiltank-esp"
 
-// -------------------- Tank (optional) --------------------
-// *_SET = false → parameter unset (no fill level / liters)
+// -------------------- Tank / distance (millimeters) --------------------
+// *_SET = false → parameter unset (no fill level / liters / max check)
 // *_SET = true  → use the matching value as default
 #define CFG_DIST_EMPTY_SET  false
-#define CFG_DIST_EMPTY_CM   100.0f   // sensor -> bottom (empty)
+#define CFG_DIST_EMPTY_MM   1000.0f  // sensor -> bottom (empty), mm
 
 #define CFG_DIST_FULL_SET   false
-#define CFG_DIST_FULL_CM    20.0f    // sensor -> oil surface (full)
+#define CFG_DIST_FULL_MM    200.0f   // sensor -> oil surface (full), mm
+
+#define CFG_DIST_MAX_SET    true
+#define CFG_DIST_MAX_MM     5000.0f  // error if measured distance > this (mm)
 
 #define CFG_TANK_LITERS_SET false
 #define CFG_TANK_LITERS     1000.0f  // volume at 100 %
 
 // -------------------- Operation --------------------
 #define CFG_INTERVAL_SEC       30       // measure / publish interval (seconds)
+#define CFG_IDLE_TIMEOUT_SEC   10       // awake grace after reset / serial before power-save
 #define CFG_WIFI_TIMEOUT_MS    15000
 #define CFG_NET_RETRIES        3        // WiFi / MQTT connect attempts
 #define CFG_NET_RETRY_DELAY_MS 1000     // pause between retries
